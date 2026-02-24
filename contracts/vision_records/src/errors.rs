@@ -130,7 +130,9 @@ impl ContractError {
             | ContractError::ConsentExpired => ErrorCategory::Authorization,
             ContractError::UserNotFound
             | ContractError::RecordNotFound
-            | ContractError::ProviderNotFound => ErrorCategory::NotFound,
+            | ContractError::ProviderNotFound
+            | ContractError::EmergencyAccessNotFound
+            | ContractError::AppointmentNotFound => ErrorCategory::NotFound,
             ContractError::ProviderAlreadyRegistered
             | ContractError::DuplicateRecord
             | ContractError::DelegationExpired
@@ -140,6 +142,7 @@ impl ContractError {
                 ErrorCategory::Transient
             }
             ContractError::Paused | ContractError::ContractPaused => ErrorCategory::System,
+            ContractError::AppointmentNotVerified => ErrorCategory::Validation,
         }
     }
 
@@ -157,6 +160,10 @@ impl ContractError {
             | ContractError::InvalidDataHash
             | ContractError::InvalidRecordType
             | ContractError::InvalidVerificationStatus
+            | ContractError::InvalidEmergencyCondition
+            | ContractError::InvalidAttestation
+            | ContractError::InvalidAppointmentTime
+            | ContractError::InvalidAppointmentStatus
             | ContractError::UserNotFound
             | ContractError::RecordNotFound
             | ContractError::ProviderNotFound

@@ -3,10 +3,14 @@ mod events;
 pub mod rbac;
 pub mod validation;
 
+pub mod appointment;
+pub mod audit;
+pub mod emergency;
 pub mod errors;
 pub mod events;
 pub mod examination;
 pub mod provider;
+pub mod rate_limit;
 
 pub mod patient_profile;
 
@@ -25,6 +29,7 @@ pub use examination::{
     SlitLampFindings, VisualAcuity, VisualField,
 };
 pub use provider::{Certification, License, Location, Provider, VerificationStatus};
+pub use rate_limit::{RateLimitConfig, RateLimitStats, RateLimitStatus};
 
 /// Storage keys for the contract
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -203,6 +208,20 @@ impl VisionRecordsContract {
     /// Initialize the contract with an admin address
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().instance().has(&INITIALIZED) {
+            let context = create_error_context(
+                &env,
+                ContractError::AlreadyInitialized,
+                Some(admin.clone()),
+                Some(String::from_str(&env, "initialize")),
+            );
+            log_error(
+                &env,
+                ContractError::AlreadyInitialized,
+                Some(admin),
+                None,
+                None,
+            );
+            events::publish_error(&env, ContractError::AlreadyInitialized as u32, context);
             return Err(ContractError::AlreadyInitialized);
         }
 
@@ -225,10 +244,20 @@ impl VisionRecordsContract {
 
     /// Get the admin address
     pub fn get_admin(env: Env) -> Result<Address, ContractError> {
-        env.storage()
-            .instance()
-            .get(&ADMIN)
-            .ok_or(ContractError::NotInitialized)
+        match env.storage().instance().get(&ADMIN) {
+            Some(admin) => Ok(admin),
+            None => {
+                let context = create_error_context(
+                    &env,
+                    ContractError::NotInitialized,
+                    None,
+                    Some(String::from_str(&env, "get_admin")),
+                );
+                log_error(&env, ContractError::NotInitialized, None, None, None);
+                events::publish_error(&env, ContractError::NotInitialized as u32, context);
+                Err(ContractError::NotInitialized)
+            }
+        }
     }
 
     /// Check if the contract is initialized
@@ -334,25 +363,26 @@ impl VisionRecordsContract {
     /// Get user information
     pub fn get_user(env: Env, user: Address) -> Result<User, ContractError> {
         let key = (symbol_short!("USER"), user.clone());
-        if let Some(user_data) = env.storage().persistent().get(&key) {
-            Ok(user_data)
-        } else {
-            let resource_id = String::from_str(&env, "get_user");
-            let context = create_error_context(
-                &env,
-                ContractError::UserNotFound,
-                Some(user.clone()),
-                Some(resource_id.clone()),
-            );
-            log_error(
-                &env,
-                ContractError::UserNotFound,
-                Some(user),
-                Some(resource_id),
-                None,
-            );
-            events::publish_error(&env, ContractError::UserNotFound as u32, context);
-            Err(ContractError::UserNotFound)
+        match env.storage().persistent().get(&key) {
+            Some(user_data) => Ok(user_data),
+            None => {
+                let resource_id = String::from_str(&env, "get_user");
+                let context = create_error_context(
+                    &env,
+                    ContractError::UserNotFound,
+                    Some(user.clone()),
+                    Some(resource_id.clone()),
+                );
+                log_error(
+                    &env,
+                    ContractError::UserNotFound,
+                    Some(user),
+                    Some(resource_id),
+                    None,
+                );
+                events::publish_error(&env, ContractError::UserNotFound as u32, context);
+                Err(ContractError::UserNotFound)
+            }
         }
     }
 
@@ -386,6 +416,27 @@ impl VisionRecordsContract {
 
         // Fall back to SystemAdmin (unified: direct role + any delegation)
         if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            // Log failed write attempt
+            let audit_entry = audit::create_audit_entry(
+                &env,
+                caller.clone(),
+                patient.clone(),
+                None,
+                AccessAction::Write,
+                AccessResult::Denied,
+                Some(String::from_str(&env, "Insufficient permissions")),
+            );
+            audit::add_audit_entry(&env, &audit_entry);
+            events::publish_audit_log_entry(&env, &audit_entry);
+
+            let context = create_error_context(
+                &env,
+                ContractError::Unauthorized,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "add_record")),
+            );
+            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
+            events::publish_error(&env, ContractError::Unauthorized as u32, context);
             return Err(ContractError::Unauthorized);
         }
 
@@ -511,19 +562,102 @@ impl VisionRecordsContract {
             let resource_id = String::from_str(&env, "get_record");
             let context = create_error_context(
                 &env,
-                ContractError::RecordNotFound,
-                None,
-                Some(resource_id.clone()),
+                ContractError::RateLimitExceeded,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "get_record")),
             );
             log_error(
                 &env,
-                ContractError::RecordNotFound,
+                ContractError::RateLimitExceeded,
+                Some(caller),
                 None,
-                Some(resource_id),
                 None,
             );
-            events::publish_error(&env, ContractError::RecordNotFound as u32, context);
-            Err(ContractError::RecordNotFound)
+            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
+            return Err(ContractError::RateLimitExceeded);
+        }
+
+        let key = (symbol_short!("RECORD"), record_id);
+        match env.storage().persistent().get::<_, VisionRecord>(&key) {
+            Some(record) => {
+                // Check access permissions
+                let has_access = if caller == record.patient || caller == record.provider {
+                    // Patient can always read their own records
+                    // Provider can read records they created
+                    true
+                } else {
+                    // Check if caller has ReadAnyRecord permission or has been granted access
+                    rbac::has_permission(&env, &caller, &Permission::ReadAnyRecord) || {
+                        let access_level =
+                            Self::check_access(env.clone(), record.patient.clone(), caller.clone());
+                        access_level != AccessLevel::None
+                    }
+                };
+
+                if !has_access {
+                    // Log failed access attempt
+                    let audit_entry = audit::create_audit_entry(
+                        &env,
+                        caller.clone(),
+                        record.patient.clone(),
+                        Some(record_id),
+                        AccessAction::Read,
+                        AccessResult::Denied,
+                        Some(String::from_str(&env, "Insufficient permissions")),
+                    );
+                    audit::add_audit_entry(&env, &audit_entry);
+                    events::publish_audit_log_entry(&env, &audit_entry);
+
+                    return Err(ContractError::Unauthorized);
+                }
+
+                // Log successful access
+                let audit_entry = audit::create_audit_entry(
+                    &env,
+                    caller.clone(),
+                    record.patient.clone(),
+                    Some(record_id),
+                    AccessAction::Read,
+                    AccessResult::Success,
+                    None,
+                );
+                audit::add_audit_entry(&env, &audit_entry);
+                events::publish_audit_log_entry(&env, &audit_entry);
+
+                Ok(record)
+            }
+            None => {
+                // Log failed access attempt (record not found)
+                // We don't know the patient, so we'll use caller as placeholder
+                let audit_entry = audit::create_audit_entry(
+                    &env,
+                    caller.clone(),
+                    caller.clone(), // Placeholder since we don't know patient
+                    Some(record_id),
+                    AccessAction::Read,
+                    AccessResult::NotFound,
+                    Some(String::from_str(&env, "Record not found")),
+                );
+                audit::add_audit_entry(&env, &audit_entry);
+                events::publish_audit_log_entry(&env, &audit_entry);
+
+                let resource_id = String::from_str(&env, "get_record");
+                let context = create_error_context(
+                    &env,
+                    ContractError::RecordNotFound,
+                    None,
+                    Some(resource_id.clone()),
+                );
+                log_error(
+                    &env,
+                    ContractError::RecordNotFound,
+                    None,
+                    Some(resource_id),
+                    None,
+                );
+                events::publish_error(&env, ContractError::RecordNotFound as u32, context);
+                Err(ContractError::RecordNotFound)
+            }
         }
     }
 
@@ -646,6 +780,18 @@ impl VisionRecordsContract {
         };
 
         if !has_perm {
+            // Log failed access grant attempt
+            let audit_entry = audit::create_audit_entry(
+                &env,
+                caller.clone(),
+                patient.clone(),
+                None,
+                AccessAction::GrantAccess,
+                AccessResult::Denied,
+                Some(String::from_str(&env, "Insufficient permissions")),
+            );
+            audit::add_audit_entry(&env, &audit_entry);
+            events::publish_audit_log_entry(&env, &audit_entry);
             return Err(ContractError::Unauthorized);
         }
 
@@ -753,6 +899,7 @@ impl VisionRecordsContract {
     /// Revoke access
     pub fn revoke_access(
         env: Env,
+        caller: Address,
         patient: Address,
         grantee: Address,
     ) -> Result<(), ContractError> {
@@ -764,6 +911,19 @@ impl VisionRecordsContract {
 
         let key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
         env.storage().persistent().remove(&key);
+
+        // Log successful access revoke
+        let audit_entry = audit::create_audit_entry(
+            &env,
+            caller.clone(),
+            patient.clone(),
+            None,
+            AccessAction::RevokeAccess,
+            AccessResult::Success,
+            None,
+        );
+        audit::add_audit_entry(&env, &audit_entry);
+        events::publish_audit_log_entry(&env, &audit_entry);
 
         events::publish_access_revoked(&env, patient, grantee);
 
