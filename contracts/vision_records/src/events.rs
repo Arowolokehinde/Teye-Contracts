@@ -146,9 +146,69 @@ pub fn publish_access_revoked(env: &Env, patient: Address, grantee: Address) {
     env.events().publish(topics, data);
 }
 
-pub fn publish_batch_records_added(env: &Env, provider: Address, count: u32) {
-    let topics = (symbol_short!("BATCH_R"), provider.clone());
-    let data = BatchRecordsAddedEvent {
+/// Event published when a new provider is registered.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRegisteredEvent {
+    pub provider: Address,
+    pub name: String,
+    pub provider_id: u64,
+    pub timestamp: u64,
+}
+
+/// Event published when an eye examination is added to a record.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExaminationAddedEvent {
+    pub record_id: u64,
+    pub timestamp: u64,
+}
+
+/// Event published when a provider's verification status is updated.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderVerifiedEvent {
+    pub provider: Address,
+    pub verifier: Address,
+    pub status: VerificationStatus,
+    pub timestamp: u64,
+}
+
+/// Event published when provider information is updated.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderUpdatedEvent {
+    pub provider: Address,
+    pub timestamp: u64,
+}
+
+/// Publishes an event when a new provider is registered.
+/// This event includes the provider address, name, provider ID, and registration timestamp.
+pub fn publish_provider_registered(env: &Env, provider: Address, name: String, provider_id: u64) {
+    let topics = (symbol_short!("PROV_REG"), provider.clone());
+    let data = ProviderRegisteredEvent {
+        provider,
+        name,
+        provider_id,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Publishes an event when a provider's verification status is updated.
+/// This event includes the provider, verifier, new status, and verification timestamp.
+pub fn publish_provider_verified(
+    env: &Env,
+    provider: Address,
+    verifier: Address,
+    status: VerificationStatus,
+) {
+    let topics = (
+        symbol_short!("PROV_VER"),
+        provider.clone(),
+        verifier.clone(),
+    );
+    let data = ProviderVerifiedEvent {
         provider,
         count,
         timestamp: env.ledger().timestamp(),
@@ -163,5 +223,37 @@ pub fn publish_batch_access_granted(env: &Env, patient: Address, count: u32) {
         count,
         timestamp: env.ledger().timestamp(),
     };
+    env.events().publish(topics, data);
+}
+
+/// Publishes an event when an examination is added.
+/// This event includes the record ID.
+pub fn publish_examination_added(env: &Env, record_id: u64) {
+    let topics = (symbol_short!("EXAM_ADD"), record_id);
+    let data = ExaminationAddedEvent {
+        record_id,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Publishes an error event for monitoring and indexing.
+/// This event includes error code, category, severity, message, user, resource ID, retryable flag, and timestamp.
+pub fn publish_error(env: &Env, error_code: u32, context: ErrorContext) {
+    let topics = (
+        symbol_short!("ERROR"),
+        context.category.clone(),
+        context.severity.clone(),
+    );
+    let data = (
+        error_code,
+        context.category,
+        context.severity,
+        context.message,
+        context.user,
+        context.resource_id,
+        context.retryable,
+        context.timestamp,
+    );
     env.events().publish(topics, data);
 }

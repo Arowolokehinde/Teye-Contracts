@@ -3,6 +3,11 @@ mod events;
 pub mod rbac;
 pub mod validation;
 
+pub mod errors;
+pub mod events;
+pub mod examination;
+pub mod provider;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
     Symbol, Vec,
@@ -10,6 +15,11 @@ use soroban_sdk::{
 
 pub use errors::{
     create_error_context, log_error, ContractError, ErrorCategory, ErrorLogEntry, ErrorSeverity,
+};
+pub use examination::{
+    EyeExamination, FundusPhotography, IntraocularPressure, OptFundusPhotography,
+    OptPhysicalMeasurement, OptRetinalImaging, OptVisualField, PhysicalMeasurement, RetinalImaging,
+    SlitLampFindings, VisualAcuity, VisualField,
 };
 pub use provider::{Certification, License, Location, Provider, VerificationStatus};
 
@@ -423,19 +433,84 @@ impl VisionRecordsContract {
         }
     }
 
-    /// Get multiple vision records by ID
-    pub fn get_records(env: Env, record_ids: Vec<u64>) -> Result<Vec<VisionRecord>, ContractError> {
-        let mut records = Vec::new(&env);
-        for id in record_ids.iter() {
-            let key = (symbol_short!("RECORD"), id);
-            let record = env
-                .storage()
-                .persistent()
-                .get::<_, VisionRecord>(&key)
-                .ok_or(ContractError::RecordNotFound)?;
-            records.push_back(record);
+    /// Add eye examination details for an existing record
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_eye_examination(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+        visual_acuity: VisualAcuity,
+        iop: IntraocularPressure,
+        slit_lamp: SlitLampFindings,
+        visual_field: OptVisualField,
+        retina_imaging: OptRetinalImaging,
+        fundus_photo: OptFundusPhotography,
+        clinical_notes: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let record = Self::get_record(env.clone(), record_id)?;
+
+        let has_perm = if caller == record.provider {
+            rbac::has_permission(&env, &caller, &Permission::WriteRecord)
+        } else {
+            rbac::has_delegated_permission(
+                &env,
+                &record.provider,
+                &caller,
+                &Permission::WriteRecord,
+            )
+        };
+
+        if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
         }
-        Ok(records)
+
+        if record.record_type != RecordType::Examination {
+            return Err(ContractError::InvalidRecordType);
+        }
+
+        let exam = EyeExamination {
+            record_id,
+            visual_acuity,
+            iop,
+            slit_lamp,
+            visual_field,
+            retina_imaging,
+            fundus_photo,
+            clinical_notes,
+        };
+
+        examination::set_examination(&env, &exam);
+        events::publish_examination_added(&env, record_id);
+
+        Ok(())
+    }
+
+    /// Retrieve eye examination details for a record
+    pub fn get_eye_examination(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+    ) -> Result<EyeExamination, ContractError> {
+        caller.require_auth();
+        let record = Self::get_record(env.clone(), record_id)?;
+
+        let has_perm = if caller == record.patient || caller == record.provider {
+            true
+        } else {
+            let access = Self::check_access(env.clone(), record.patient.clone(), caller.clone());
+            access == AccessLevel::Read
+                || access == AccessLevel::Write
+                || access == AccessLevel::Full
+                || rbac::has_permission(&env, &caller, &Permission::SystemAdmin)
+        };
+
+        if !has_perm {
+            return Err(ContractError::AccessDenied);
+        }
+
+        examination::get_examination(&env, record_id).ok_or(ContractError::RecordNotFound)
     }
 
     /// Get all records for a patient
