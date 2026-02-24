@@ -3,7 +3,7 @@ Teye-Contracts: Soroban Event Poller Example
 ----------------------------------------------
 Polls the Soroban RPC for events emitted by your contract.
 
-Install: pip install stellar-sdk
+Install: pip install "stellar-sdk>=13.0.0" pydantic requests
 """
 import time
 import pydantic
@@ -25,31 +25,41 @@ def main():
         print(f"Network Connection failed: {e}")
         return
         
-    # Use the EventFilterType enum instead of a raw string
     contract_filter = EventFilter(type=EventFilterType.CONTRACT, contract_ids=[CONTRACT_ID])
-    last_cursor = None
 
     while True:
         try:
             current_ledger = server.get_latest_ledger().sequence
             if current_ledger >= start_ledger:
                 
+                # Reset cursor for the new ledger tracking range
+                last_cursor = None
                 fetching_pages = True
+                
                 while fetching_pages:
-                    # Fix limit syntax and use cursor for pagination
-                    response = server.get_events(
-                        start_ledger=start_ledger,
-                        filters=[contract_filter],
-                        limit=100,
-                        cursor=last_cursor
-                    )
+                    
+                    # Protocol 23: start_ledger and cursor are mutually exclusive.
+                    if last_cursor:
+                        # Page 2+: Query by cursor only
+                        response = server.get_events(
+                            cursor=last_cursor,
+                            filters=[contract_filter],
+                            limit=100
+                        )
+                    else:
+                        # Page 1: Query by start_ledger only
+                        response = server.get_events(
+                            start_ledger=start_ledger,
+                            filters=[contract_filter],
+                            limit=100
+                        )
                     
                     if response.events:
                         for event in response.events:
                             print(f"🔔 Processed Event [{event.id}] in Ledger {event.ledger}")
                         
-                        # Update the cursor to the final event in this batch
-                        last_cursor = response.events[-1].paging_token
+                        # Protocol 23: paging_token removed from events. Use top-level cursor.
+                        last_cursor = response.cursor
                         
                         if len(response.events) < 100:
                             fetching_pages = False
@@ -69,7 +79,7 @@ def main():
         except TypeError as e:
             print(f"Pagination type error: {e}")
         except Exception as e:
-            raise e
+            raise
             
         time.sleep(POLL_INTERVAL_SECONDS)
 

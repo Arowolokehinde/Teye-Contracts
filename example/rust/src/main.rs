@@ -3,7 +3,7 @@ use soroban_sdk::{contract, contractimpl, Env, String, Address};
 
 /*
  * Teye-Contracts: Rust Integration Example
- * Add to Cargo.toml: soroban-sdk = "20.0.0" 
+ * Add to Cargo.toml: soroban-sdk = "22.0.0"
  *
  * PREREQUISITE:
  * This example requires the Teye smart contract to be built first, as the macro 
@@ -14,7 +14,7 @@ use soroban_sdk::{contract, contractimpl, Env, String, Address};
 
 // Generate Client bindings from compiled WASM
 soroban_sdk::contractimport!(
-    file = "../../target/wasm32-unknown-unknown/release/teye_contract.wasm"
+    file = "../../target/wasm32v1-none/release/teye_contract.wasm"
 );
 
 #[contract]
@@ -22,7 +22,10 @@ pub struct ThirdPartyApp;
 
 #[contractimpl]
 impl ThirdPartyApp {
-    /// Example of a third-party contract interacting with Teye-Contracts
+    /// ⚠️  WARNING: Accepting the target contract address as a parameter is for
+    ///    illustration only. In production, store and read the trusted contract
+    ///    address from contract storage to prevent callers from redirecting calls
+    ///    to arbitrary contracts.
     pub fn interact_with_teye(env: Env, teye_contract_id: Address, user_data: String) -> String {
         let teye_client = Client::new(&env, &teye_contract_id);
         
