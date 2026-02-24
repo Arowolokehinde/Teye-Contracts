@@ -8,11 +8,14 @@ pub mod events;
 pub mod examination;
 pub mod provider;
 
+pub mod patient_profile;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
     Symbol, Vec,
 };
 
+use crate::patient_profile::{EmergencyContact, InsuranceInfo, PatientProfile};
 pub use errors::{
     create_error_context, log_error, ContractError, ErrorCategory, ErrorLogEntry, ErrorSeverity,
 };
@@ -821,7 +824,189 @@ impl VisionRecordsContract {
 
     /// Contract version
     pub fn version() -> u32 {
-        1
+        2  // Updated for patient profile management
+    }
+
+    // ======================== Patient Profile Management ========================
+
+    /// Create a new patient profile
+    pub fn create_profile(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        date_of_birth_hash: String,
+        gender_hash: String,
+        blood_type_hash: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only patient or authorized user can create profile
+        if caller != patient && !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        // Check if profile already exists
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        if env.storage().persistent().has(&profile_key) {
+            return Err(ContractError::InvalidInput); // Profile already exists
+        }
+        
+        let profile = PatientProfile {
+            patient: patient.clone(),
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            is_active: true,
+            date_of_birth_hash,
+            gender_hash,
+            blood_type_hash,
+            emergency_contact: None,
+            insurance_info: None,
+            medical_history_refs: Vec::new(&env),
+        };
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_created(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Update patient demographics
+    pub fn update_demographics(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        date_of_birth_hash: String,
+        gender_hash: String,
+        blood_type_hash: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.date_of_birth_hash = date_of_birth_hash;
+        profile.gender_hash = gender_hash;
+        profile.blood_type_hash = blood_type_hash;
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Update emergency contact information
+    pub fn update_emergency_contact(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        contact: Option<EmergencyContact>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.emergency_contact = contact;
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Update insurance information (hashed values only)
+    pub fn update_insurance(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        insurance_info: Option<InsuranceInfo>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.insurance_info = insurance_info;
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Add medical history reference (IPFS hash or record ID)
+    pub fn add_medical_history_reference(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        reference: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.medical_history_refs.push_back(reference);
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Get patient profile
+    pub fn get_profile(env: Env, patient: Address) -> Result<PatientProfile, ContractError> {
+        let profile_key = (symbol_short!("PAT_PROF"), patient);
+        env.storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)
+    }
+
+    /// Check if patient profile exists
+    pub fn profile_exists(env: Env, patient: Address) -> bool {
+        let profile_key = (symbol_short!("PAT_PROF"), patient);
+        env.storage().persistent().has(&profile_key)
     }
 
     // ======================== RBAC Endpoints ========================
