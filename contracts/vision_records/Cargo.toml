@@ -18,8 +18,7 @@ path = "tests/property/main.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
-audit       = { path = "../audit" }
-teye-common = { path = "../common", package = "common" }
+teye-common = { path = "../common", package = "common", features = ["std"]}
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

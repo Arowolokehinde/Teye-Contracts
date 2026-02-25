@@ -60,7 +60,6 @@ pub struct VisualField {
     pub right_eye_defects: String,
 }
 
-#[allow(clippy::large_enum_variant)]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -77,7 +76,6 @@ pub struct RetinalImaging {
     pub findings: String,
 }
 
-#[allow(clippy::large_enum_variant)]
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]

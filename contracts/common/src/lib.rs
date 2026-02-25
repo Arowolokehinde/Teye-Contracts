@@ -33,20 +33,20 @@ pub mod meta_tx;
 pub mod metering;
 pub mod migration;
 pub mod multisig;
-pub mod operational_transform;
+pub mod nonce;
 pub mod pausable;
 pub mod policy_dsl;
-pub mod policy_engine;
 pub mod progressive_auth;
-/// High-level provenance graph traversal, access control, and export.
-pub mod provenance_graph;
 pub mod rate_limit;
 pub mod reentrancy_guard;
-pub mod risk_engine;
 pub mod session;
+pub mod risk_engine;
 pub mod vector_clock;
 pub mod versioned_storage;
 pub mod whitelist;
+pub mod transaction;
+
+pub mod credential_types;
 
 pub use admin_tiers::*;
 pub use concurrency::{
@@ -65,23 +65,15 @@ pub use meta_tx::*;
 pub use metering::*;
 pub use migration::*;
 pub use multisig::*;
-pub use operational_transform::*;
-pub use pausable::*;
-pub use policy_dsl::*;
-pub use policy_engine::{
-    evaluate, evaluate_cached, evaluate_rule, get_resolution_strategy, set_resolution_strategy,
-    simulate,
-};
-pub use conflict_resolver::ResolutionStrategy as PolicyStrategy;
-pub use progressive_auth::*;
-pub use provenance_graph::{LineageAccessResult, ProvenanceExport};
+pub use nonce::*;
 pub use rate_limit::*;
 pub use reentrancy_guard::*;
-pub use risk_engine::*;
 pub use session::*;
+pub use risk_engine::*;
 pub use vector_clock::*;
 pub use versioned_storage::*;
 pub use whitelist::*;
+pub use credential_types::*;
 
 // ── Shared error enum ────────────────────────────────────────────────────────
 
@@ -101,54 +93,36 @@ pub use whitelist::*;
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 #[repr(u32)]
 pub enum CommonError {
-    // ── Lifecycle (1–9) ──────────────────────────────────────
-    /// The contract has not been initialised yet.
-    /// Returned when a function requires prior initialisation.
     NotInitialized = 1,
-
-    /// The contract has already been initialised.
-    /// Returned when `initialize` is called more than once.
     AlreadyInitialized = 2,
-
-    // ── Auth (10–19) ─────────────────────────────────────────
-    /// The caller lacks the required role or permission to perform
-    /// the requested operation (e.g. not an admin, not the record owner).
     AccessDenied = 10,
-
-    // ── Not-found (20–29) ────────────────────────────────────
-    /// The requested user does not exist in contract storage.
     UserNotFound = 20,
-
-    /// The requested record does not exist in contract storage.
     RecordNotFound = 21,
-
-    // ── Validation (30–39) ───────────────────────────────────
-    /// One or more input parameters are invalid (e.g. empty list,
-    /// zero duration, malformed hash).
     InvalidInput = 30,
-
+    /// Nonce does not match the expected value (replay or out-of-order).
+    InvalidNonce = 31,
+    /// Nonce counter would exceed u64::MAX.
+    NonceOverflow = 32,
     // ── Contract state (40–49) ───────────────────────────────
     /// The contract is currently paused and cannot process requests.
     Paused = 40,
+    InvalidChannelState = 50,
+    InvalidSignature = 51,
+    InvalidTransition = 52,
+    ChallengePeriodActive = 53,
+    AlreadySettled = 54,
+}
 
-    // ── Lineage / Provenance (60–69) ─────────────────────────────────────
-    /// The requested lineage node does not exist.
-    LineageNodeNotFound = 60,
-
-    /// The requested lineage edge does not exist.
-    LineageEdgeNotFound = 61,
-
-    /// A required ancestor node is missing from the provenance chain.
-    LineageAncestorMissing = 62,
-
-    /// A commitment mismatch was detected — the lineage has been tampered with.
-    LineageTampered = 63,
-
-    /// The lineage graph would form a cycle; DAG invariant must be preserved.
-    LineageCycleDetected = 64,
-
-    /// The caller does not have lineage-based access to the requested record.
-    LineageAccessDenied = 65,
+/// Shared channel status for lifespan tracking
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[repr(u32)]
+pub enum ChannelStatus {
+    Open = 0,
+    Closing = 1,
+    Closed = 2,
+    Settled = 3,
+    Disputed = 4,
 }
 
 #[cfg(test)]
@@ -163,6 +137,8 @@ mod tests {
         assert_eq!(CommonError::UserNotFound as u32, 20);
         assert_eq!(CommonError::RecordNotFound as u32, 21);
         assert_eq!(CommonError::InvalidInput as u32, 30);
+        assert_eq!(CommonError::InvalidNonce as u32, 31);
+        assert_eq!(CommonError::NonceOverflow as u32, 32);
         assert_eq!(CommonError::Paused as u32, 40);
         // Lineage range.
         assert_eq!(CommonError::LineageNodeNotFound as u32, 60);
