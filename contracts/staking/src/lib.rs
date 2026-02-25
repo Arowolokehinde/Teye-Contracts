@@ -17,6 +17,24 @@ use soroban_sdk::{
 
 use timelock::{RateChangeProposal, UnstakeRequest};
 
+/// Preparation data for staking operation
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareStake {
+    pub staker: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Preparation data for withdrawal operation
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareWithdraw {
+    pub staker: Address,
+    pub request_id: u64,
+    pub timestamp: u64,
+}
+
 // ── Storage key constants ────────────────────────────────────────────────────
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -982,38 +1000,206 @@ impl StakingContract {
             .persistent()
             .set(&(USER_RPT_PAID, user.clone()), &current_rpt);
     }
-    
-    /// Penalize a staker by reducing their staked balance.
-    ///
-    /// Requires at least `ContractAdmin` tier or a specific authorized caller.
-    pub fn slash(env: Env, caller: Address, staker: Address, amount: i128) -> Result<(), ContractError> {
+
+    // ===== Two-Phase Commit Hooks =====
+
+    /// Prepare phase for stake operation.
+    /// Validates inputs and stores preparation data without making state changes.
+    pub fn prepare_stake(env: Env, staker: Address, amount: i128) -> Result<(), ContractError> {
         Self::require_initialized(&env)?;
-        caller.require_auth();
-        
-        // Ensure the caller has permission to slash. 
-        // In a production system, this might also check against an authorized delegation contract address.
-        Self::require_admin_tier(&env, &caller, &AdminTier::ContractAdmin, "slash")?;
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Check if staker has sufficient balance (without actually transferring)
+        let stake_token: Address = env.storage().instance().get(&STAKE_TOKEN)
+            .ok_or(ContractError::NotInitialized)?;
+
+        let balance = token::Client::new(&env, &stake_token).balance(&staker);
+        if balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        // Store temporary preparation data keyed by staker
+        let prep_key = (symbol_short!("PREP_STK"), staker.clone());
+        let prep_data = PrepareStake {
+            staker: staker.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for stake operation.
+    /// Retrieves preparation data and executes the actual stake.
+    pub fn commit_stake(env: Env, staker: Address, amount: i128) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+
+        // Retrieve and verify preparation data
+        let prep_key = (symbol_short!("PREP_STK"), staker.clone());
+        let prep_data: PrepareStake = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        if prep_data.staker != staker || prep_data.amount != amount {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Clean up preparation data before executing (checks-effects-interactions)
+        env.storage().temporary().remove(&prep_key);
+
+        // Execute the actual staking
+        Self::stake(env, staker, amount)
+    }
+
+    /// Rollback for stake operation.
+    /// Cleans up preparation data without making state changes.
+    pub fn rollback_stake(env: Env, staker: Address, _amount: i128) -> Result<(), ContractError> {
+        let prep_key = (symbol_short!("PREP_STK"), staker);
+        env.storage().temporary().remove(&prep_key);
+        Ok(())
+    }
+
+    /// Prepare phase for request_unstake operation.
+    /// Validates that the staker has sufficient staked balance.
+    pub fn prepare_request_unstake(env: Env, staker: Address, amount: i128) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
 
         if amount <= 0 {
             return Err(ContractError::InvalidInput);
         }
 
         let user_stake_key = (USER_STAKE, staker.clone());
-        let prev_stake: i128 = env.storage().persistent().get(&user_stake_key).unwrap_or(0);
-        
-        if prev_stake == 0 {
-            return Ok(()); // Nothing to slash
+        let staked: i128 = env.storage().persistent().get(&user_stake_key).unwrap_or(0);
+        if staked < amount {
+            return Err(ContractError::InsufficientBalance);
         }
 
-        let new_stake = prev_stake.saturating_sub(amount);
-        env.storage().persistent().set(&user_stake_key, &new_stake);
+        let prep_key = (symbol_short!("PREP_USTK"), staker.clone());
+        let prep_data = PrepareStake {
+            staker: staker.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
 
-        let prev_total: i128 = env.storage().instance().get(&TOTAL_STAKED).unwrap_or(0);
-        let new_total = prev_total.saturating_sub(prev_stake.min(amount));
-        env.storage().instance().set(&TOTAL_STAKED, &new_total);
+        Ok(())
+    }
 
-        events::publish_staked(&env, staker, -amount, new_total); // Reusing staked event for balance changes
+    /// Commit phase for request_unstake operation.
+    pub fn commit_request_unstake(env: Env, staker: Address, amount: i128) -> Result<u64, ContractError> {
+        Self::require_initialized(&env)?;
 
+        let prep_key = (symbol_short!("PREP_USTK"), staker.clone());
+        let prep_data: PrepareStake = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        if prep_data.staker != staker || prep_data.amount != amount {
+            return Err(ContractError::InvalidInput);
+        }
+
+        env.storage().temporary().remove(&prep_key);
+
+        Self::request_unstake(env, staker, amount)
+    }
+
+    /// Rollback for request_unstake operation.
+    pub fn rollback_request_unstake(env: Env, staker: Address, _amount: i128) -> Result<(), ContractError> {
+        let prep_key = (symbol_short!("PREP_USTK"), staker);
+        env.storage().temporary().remove(&prep_key);
+        Ok(())
+    }
+
+    /// Prepare phase for withdraw operation.
+    /// Validates timelock expiry and withdrawal eligibility.
+    pub fn prepare_withdraw(env: Env, staker: Address, request_id: u64) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+
+        // Validate via the timelock module's actual storage
+        let request = timelock::get_request(&env, request_id)
+            .ok_or(ContractError::RequestNotFound)?;
+
+        if request.staker != staker {
+            return Err(ContractError::Unauthorized);
+        }
+        if request.withdrawn {
+            return Err(ContractError::AlreadyWithdrawn);
+        }
+        if env.ledger().timestamp() < request.unlock_at {
+            return Err(ContractError::TimelockNotExpired);
+        }
+
+        let prep_key = (symbol_short!("PREP_WDR"), staker.clone(), request_id);
+        let prep_data = PrepareWithdraw {
+            staker: staker.clone(),
+            request_id,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for withdraw operation.
+    pub fn commit_withdraw(env: Env, staker: Address, request_id: u64) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+
+        let prep_key = (symbol_short!("PREP_WDR"), staker.clone(), request_id);
+        let prep_data: PrepareWithdraw = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        if prep_data.staker != staker || prep_data.request_id != request_id {
+            return Err(ContractError::InvalidInput);
+        }
+
+        env.storage().temporary().remove(&prep_key);
+
+        Self::withdraw(env, staker, request_id)
+    }
+
+    /// Rollback for withdraw operation.
+    pub fn rollback_withdraw(env: Env, staker: Address, request_id: u64) -> Result<(), ContractError> {
+        let prep_key = (symbol_short!("PREP_WDR"), staker, request_id);
+        env.storage().temporary().remove(&prep_key);
+        Ok(())
+    }
+
+    /// Prepare phase for claim_rewards operation.
+    /// Validates that staker has pending rewards.
+    pub fn prepare_claim_rewards(env: Env, staker: Address) -> Result<(), ContractError> {
+        Self::require_initialized(&env)?;
+
+        // Check pending rewards without mutating state
+        let pending = Self::get_pending_rewards(env.clone(), staker.clone());
+        if pending <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let prep_key = (symbol_short!("PREP_CLM"), staker.clone());
+        env.storage().temporary().set(&prep_key, &env.ledger().timestamp());
+
+        Ok(())
+    }
+
+    /// Commit phase for claim_rewards operation.
+    pub fn commit_claim_rewards(env: Env, staker: Address) -> Result<i128, ContractError> {
+        Self::require_initialized(&env)?;
+
+        let prep_key = (symbol_short!("PREP_CLM"), staker.clone());
+        let _timestamp: u64 = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        env.storage().temporary().remove(&prep_key);
+
+        Self::claim_rewards(env, staker)
+    }
+
+    /// Rollback for claim_rewards operation.
+    pub fn rollback_claim_rewards(env: Env, staker: Address) -> Result<(), ContractError> {
+        let prep_key = (symbol_short!("PREP_CLM"), staker);
+        env.storage().temporary().remove(&prep_key);
         Ok(())
     }
 }

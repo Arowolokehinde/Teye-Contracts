@@ -138,11 +138,7 @@ fn has_active_consent(env: &Env, patient: &Address, grantee: &Address) -> bool {
     }
 }
 
-pub use rbac::{
-    build_eval_context, check_policy_engine, create_access_policy, evaluate_access_policies,
-    set_record_sensitivity, set_user_credential, simulate_policy_check, AccessPolicy,
-    CredentialType, Permission, PolicyContext, Role, SensitivityLevel, TimeRestriction,
-};
+pub use rbac::{Permission, Role, AccessPolicy, PolicyContext, evaluate_access_policies, set_user_credential, set_record_sensitivity, create_access_policy, CredentialType, SensitivityLevel, TimeRestriction};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,14 +152,67 @@ pub enum ConsentType {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessLevel {
-    /// No access to the record
     None,
-    /// Read-only access to the record
     Read,
-    /// Write access to the record
     Write,
-    /// Full access including read, write, and delete
-    Full,
+    Admin,
+}
+
+/// Preparation data for user registration
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareUserRegistration {
+    pub caller: Address,
+    pub user: Address,
+    pub role: Role,
+    pub name: String,
+    pub timestamp: u64,
+}
+
+/// Preparation data for record addition
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareRecordAddition {
+    pub caller: Address,
+    pub patient: Address,
+    pub provider: Address,
+    pub record_type: RecordType,
+    pub data_hash: String,
+    pub timestamp: u64,
+}
+
+/// Preparation data for adding a vision record
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareAddRecord {
+    pub caller: Address,
+    pub patient: Address,
+    pub provider: Address,
+    pub record_type: RecordType,
+    pub data_hash: String,
+    pub timestamp: u64,
+}
+
+/// Preparation data for granting access
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareGrantAccess {
+    pub caller: Address,
+    pub patient: Address,
+    pub grantee: Address,
+    pub access_level: AccessLevel,
+    pub expires_at: Option<u64>,
+    pub timestamp: u64,
+}
+
+/// Preparation data for adding a prescription
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PrepareAddPrescription {
+    pub patient: Address,
+    pub provider: Address,
+    pub prescription_data: prescription::PrescriptionData,
+    pub timestamp: u64,
 }
 
 /// Vision record types
@@ -1686,11 +1735,10 @@ impl VisionRecordsContract {
         if let Some(grant) = env.storage().persistent().get::<_, AccessGrant>(&key) {
             if grant.expires_at > env.ledger().timestamp() {
                 // Check if ABAC policies also allow this access
-                // let abac_allowed =
-                // evaluate_access_policies(&env, &grantee, None, Some(patient.clone()));
-                // if abac_allowed {
-                return grant.level;
-                // }
+                let abac_allowed = evaluate_access_policies(&env, &grantee, None, Some(patient.clone()));
+                if abac_allowed {
+                    return grant.level;
+                }
             }
         }
         AccessLevel::None
@@ -2145,537 +2193,648 @@ impl VisionRecordsContract {
         rbac::has_permission(&env, &user, &permission)
     }
 
-    // ======================== Admin Tier Management ========================
-
-    /// Promotes or assigns a target address to the specified admin tier.
-    ///
-    /// Only a `SuperAdmin` may call this.
-    pub fn promote_admin(
+    /// Create an access policy with ABAC attributes
+    pub fn create_access_policy(
         env: Env,
         caller: Address,
-        target: Address,
-        tier: AdminTier,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !admin_tiers::promote_admin(&env, &caller, &target, tier) {
-            return Self::unauthorized(&env, &caller, "promote_admin", "admin_tier:SuperAdmin");
-        }
-        admin_tiers::track_admin(&env, &target);
-        Ok(())
-    }
-
-    /// Removes the admin tier from the target address entirely.
-    ///
-    /// Only a `SuperAdmin` may call this.
-    pub fn demote_admin(env: Env, caller: Address, target: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !admin_tiers::demote_admin(&env, &caller, &target) {
-            return Self::unauthorized(&env, &caller, "demote_admin", "admin_tier:SuperAdmin");
-        }
-        admin_tiers::untrack_admin(&env, &target);
-        Ok(())
-    }
-
-    /// Returns the admin tier of the given address, if any.
-    pub fn get_admin_tier(env: Env, admin: Address) -> Option<AdminTier> {
-        admin_tiers::get_admin_tier(&env, &admin)
-    }
-
-    // ======================== Policy Engine Management ========================
-
-    /// Stores a composable policy definition on-chain.
-    /// Requires SystemAdmin permission or admin tier.
-    pub fn store_policy(
-        env: Env,
-        caller: Address,
-        policy: teye_common::policy_dsl::PolicyDefinition,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
-            return Self::unauthorized(&env, &caller, "store_policy", "admin_tier:ContractAdmin");
-        }
-        teye_common::policy_engine::store_policy(&env, &policy);
-        Ok(())
-    }
-
-    /// Removes a composable policy definition from on-chain storage.
-    /// Requires SystemAdmin permission or admin tier.
-    pub fn remove_policy(
-        env: Env,
-        caller: Address,
-        policy_id: teye_common::policy_dsl::PolicyId,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
-            return Self::unauthorized(&env, &caller, "remove_policy", "admin_tier:ContractAdmin");
-        }
-        teye_common::policy_engine::remove_policy(&env, &policy_id);
-        Ok(())
-    }
-
-    /// Lists all registered policy identifiers.
-    pub fn list_policies(env: Env) -> Vec<teye_common::policy_dsl::PolicyId> {
-        teye_common::policy_engine::list_policies(&env)
-    }
-
-    /// Sets the conflict resolution strategy used by the policy engine.
-    /// Requires SystemAdmin permission or admin tier.
-    pub fn set_policy_resolution_strategy(
-        env: Env,
-        caller: Address,
-        strategy: teye_common::conflict_resolver::ResolutionStrategy,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
-            return Self::unauthorized(
-                &env,
-                &caller,
-                "set_policy_resolution_strategy",
-                "admin_tier:ContractAdmin",
-            );
-        }
-        teye_common::policy_engine::set_resolution_strategy(&env, strategy);
-        Ok(())
-    }
-
-    /// Evaluates the composable policy engine for the calling user.
-    /// Returns true if the policy engine permits the action.
-    pub fn evaluate_policy_engine(
-        env: Env,
-        caller: Address,
-        action: String,
-        resource_id: Option<u64>,
-    ) -> bool {
-        let action_str: alloc::string::String = action.to_string();
-        rbac::check_policy_engine(&env, &caller, &action_str, resource_id)
-    }
-
-    /// Runs a what-if policy simulation without applying changes.
-    pub fn simulate_policy(
-        env: Env,
-        caller: Address,
-        action: String,
-        resource_id: Option<u64>,
-    ) -> teye_common::policy_dsl::SimulationResult {
-        let action_str: alloc::string::String = action.to_string();
-        rbac::simulate_policy_check(&env, &caller, &action_str, resource_id)
-    }
-
-    // ======================== Compliance Hooks ========================
-
-    /// Emit a compliance-check event for an operation.
-    ///
-    /// This is a lightweight on-chain hook that publishes a structured event
-    /// for off-chain compliance engines (HIPAA/GDPR rule evaluation) to
-    /// consume. The event includes the actor, action, target, sensitivity
-    /// level, and purpose — sufficient for the rules engine to evaluate
-    /// compliance without storing PHI on-chain.
-    ///
-    /// Off-chain compliance services subscribe to these events and run the
-    /// full rules engine (see `compliance::rules_engine`) to produce verdicts
-    /// and alerts.
-    pub fn emit_compliance_check(
-        env: Env,
-        caller: Address,
-        action: String,
-        target: String,
-        sensitivity: u32,
-        purpose: String,
-        has_consent: bool,
-        record_count: u32,
-    ) {
-        #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("COMP_CHK"), caller.clone()),
-            (action, target, sensitivity, purpose, has_consent, record_count),
-        );
-    }
-
-    /// Emit a compliance violation event.
-    ///
-    /// Called by off-chain compliance services when a rule violation is
-    /// detected. This creates an on-chain record of the violation for
-    /// audit trail purposes.
-    pub fn emit_compliance_violation(
-        env: Env,
-        caller: Address,
-        rule_id: String,
-        severity: u32,
-        description: String,
+        policy_id: String,
+        name: String,
+        required_role: Option<Role>,
+        time_restriction: TimeRestriction,
+        required_credential: CredentialType,
+        min_sensitivity_level: SensitivityLevel,
+        consent_required: bool,
     ) -> Result<(), ContractError> {
         caller.require_auth();
 
-        // Only admins can record compliance violations on-chain.
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
-            return Self::unauthorized(
-                &env,
-                &caller,
-                "emit_compliance_violation",
-                "admin_tier:ContractAdmin",
-            );
+        // Only SystemAdmin can create policies
+        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
         }
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("COMP_VIO"), caller),
-            (rule_id, severity, description),
-        );
+        let conditions = rbac::PolicyConditions {
+            required_role,
+            time_restriction,
+            required_credential,
+            min_sensitivity_level,
+            consent_required,
+        };
+
+        let policy = rbac::AccessPolicy {
+            id: policy_id.clone(),
+            name,
+            conditions,
+            enabled: true,
+        };
+
+        rbac::create_access_policy(&env, policy);
+        events::publish_policy_created(&env, policy_id, caller);
 
         Ok(())
     }
 
-    /// Emit a compliance report summary event.
-    ///
-    /// Published periodically by off-chain compliance services to anchor
-    /// aggregate compliance scores on-chain.
-    pub fn emit_compliance_report(
+    /// Set credential type for a user
+    pub fn set_user_credential(
         env: Env,
         caller: Address,
-        period_start: u64,
-        period_end: u64,
-        total_operations: u64,
-        compliance_score: u64,
-        violations_count: u32,
+        user: Address,
+        credential: CredentialType,
     ) -> Result<(), ContractError> {
         caller.require_auth();
 
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
-            return Self::unauthorized(
-                &env,
-                &caller,
-                "emit_compliance_report",
-                "admin_tier:ContractAdmin",
-            );
+        // Only SystemAdmin can set credentials
+        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
         }
 
-        #[allow(deprecated)]
-        env.events().publish(
-            (symbol_short!("COMP_RPT"), caller),
-            (period_start, period_end, total_operations, compliance_score, violations_count),
-        );
+        rbac::set_user_credential(&env, user.clone(), credential);
+        events::publish_credential_set(&env, user, credential, caller);
 
         Ok(())
     }
 
-    // ======================== Internal Helpers ========================
-
-    /// Best-effort metering hook.  Fires and forgets — a failure in the
-    /// metering contract must NOT block the primary operation.
-    fn meter_op(env: &Env, tenant: &Address, op: MeteringOpType) {
-        let hook = MeteringHook::load(env);
-        if !hook.is_configured() {
-            return;
-        }
-        // We intentionally ignore any error from the metering contract so
-        // that metering issues do not block vision record operations.
-        // NOTE: Full cross-contract invocation requires the metering contract
-        // client to be generated by the Soroban SDK.  The hook stores the
-        // contract address and records the operation type in a persistent
-        // per-address counter so the metering contract can retrieve it.
-        // This is the extensibility point for wiring in the call once the
-        // metering crate exposes a client interface.
-        // Use a per-tenant, per-operation-type counter.
-        let meter_key = (symbol_short!("MTR_OP"), tenant.clone(), op);
-        let count: u64 = env.storage().persistent().get(&meter_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&meter_key, &count.saturating_add(1));
-    }
-
-    /// Configure (or clear) the external metering contract address.
-    ///
-    /// Requires `ContractAdmin` tier or higher.
-    pub fn configure_metering(
+    /// Set sensitivity level for a record
+    pub fn set_record_sensitivity(
         env: Env,
         caller: Address,
-        metering_contract: Option<Address>,
+        record_id: u64,
+        sensitivity: SensitivityLevel,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        if !Self::has_admin_access(&env, &caller, &AdminTier::ContractAdmin) {
-            return Self::unauthorized(
-                &env,
-                &caller,
-                "configure_metering",
-                "admin_tier:ContractAdmin",
-            );
+
+        // Only record provider or SystemAdmin can set sensitivity
+        let record_key = (symbol_short!("RECORD"), record_id);
+        let record: VisionRecord = env.storage().persistent().get(&record_key)
+            .ok_or(ContractError::RecordNotFound)?;
+
+        let has_perm = caller == record.provider || rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
+        if !has_perm {
+            return Err(ContractError::Unauthorized);
         }
-        MeteringHook::configure(&env, metering_contract);
+
+        rbac::set_record_sensitivity(&env, record_id, sensitivity.clone());
+        events::publish_sensitivity_set(&env, record_id, sensitivity, caller);
+
         Ok(())
     }
 
-    /// Return the currently configured metering contract address, if any.
-    pub fn get_metering_contract(env: Env) -> Option<Address> {
-        MeteringHook::load(&env).contract
+    /// Check access for a specific record with ABAC evaluation
+    pub fn check_record_access(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+    ) -> Result<AccessLevel, ContractError> {
+        caller.require_auth();
+
+        let record_key = (symbol_short!("RECORD"), record_id);
+        let record: VisionRecord = env.storage().persistent().get(&record_key)
+            .ok_or(ContractError::RecordNotFound)?;
+
+        // Check if caller is patient or provider (always allowed)
+        if caller == record.patient || caller == record.provider {
+            return Ok(AccessLevel::Full);
+        }
+
+        // Check traditional access grants
+        let traditional_access = Self::check_access(env.clone(), record.patient.clone(), caller.clone());
+        if traditional_access != AccessLevel::None {
+            return Ok(traditional_access);
+        }
+
+        // Check ABAC policies for this specific record
+        let abac_allowed = evaluate_access_policies(&env, &caller, Some(record_id), Some(record.patient));
+        if abac_allowed {
+            return Ok(AccessLevel::Read);
+        }
+
+        Ok(AccessLevel::None)
     }
 
-    /// Unified check: returns true if caller has at least the specified admin
-    /// tier, OR is the legacy ADMIN address, OR has SystemAdmin RBAC permission.
-    fn has_admin_access(env: &Env, caller: &Address, min_tier: &AdminTier) -> bool {
-        // 1. Check tiered admin system
-        if admin_tiers::require_tier(env, caller, min_tier) {
-            return true;
+    /// Prepare phase for register_user operation
+    pub fn prepare_register_user(
+        env: Env,
+        caller: Address,
+        user: Address,
+        role: Role,
+        name: String,
+    ) -> Result<(), ContractError> {
+        // Validate all inputs without making state changes
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("REG_USR")),
+        )?;
+
+        if !whitelist::check_whitelist_access(&env, &caller) {
+            return Err(ContractError::Unauthorized);
         }
-        // 2. Fall back to legacy admin address
-        if let Some(admin) = env.storage().instance().get::<Symbol, Address>(&ADMIN) {
-            if *caller == admin {
-                return true;
+
+        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        validation::validate_name(&name)?;
+
+        // Check if user already exists
+        let key = (symbol_short!("USER"), user.clone());
+        if env.storage().persistent().get::<_, User>(&key).is_some() {
+            return Err(ContractError::UserAlreadyExists);
+        }
+
+        // Store temporary preparation data
+        let prep_key = (symbol_short!("PREP_REG_USER"), user.clone());
+        let prep_data = PrepareUserRegistration {
+            caller: caller.clone(),
+            user: user.clone(),
+            role: role.clone(),
+            name: name.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for register_user operation
+    pub fn commit_register_user(
+        env: Env,
+        caller: Address,
+        user: Address,
+        role: Role,
+        name: String,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_REG_USER"), user.clone());
+        let prep_data: PrepareUserRegistration = env.storage().temporary().get(&prep_key)
+            .ok_or(ContractError::InvalidPhase)?;
+
+        // Verify preparation data matches commit parameters
+        if prep_data.caller != caller || prep_data.user != user || 
+           prep_data.role != role || prep_data.name != name {
+            return Err(ContractError::InvalidPhase);
+        }
+
+        // Execute the actual registration
+        let user_data = User {
+            address: user.clone(),
+            role: role.clone(),
+            name: name.clone(),
+            registered_at: env.ledger().timestamp(),
+            is_active: true,
+        };
+
+        let key = (symbol_short!("USER"), user.clone());
+        env.storage().persistent().set(&key, &user_data);
+        extend_ttl_address_key(&env, &key);
+        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        events::publish_user_registered(&env, user, role, name);
+
+        Ok(())
+    }
+
+    /// Rollback for register_user operation
+    pub fn rollback_register_user(
+        env: Env,
+        user: Address,
+        _role: Role,
+        _name: String,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_REG_USER"), user.clone());
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Prepare phase for add_record operation
+    pub fn prepare_add_record(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        provider: Address,
+        record_type: RecordType,
+        data_hash: String,
+    ) -> Result<(), ContractError> {
+        // Validate all inputs without making state changes
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("ADD_REC")),
+        )?;
+
+        if !whitelist::check_whitelist_access(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Verify provider permissions
+        if !rbac::has_permission(&env, &provider, &Permission::CreateRecords) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Validate inputs
+        validation::validate_address(&patient)?;
+        validation::validate_address(&provider)?;
+        validation::validate_hash(&data_hash)?;
+
+        // Store temporary preparation data
+        let prep_key = (symbol_short!("PREP_ADD_REC"), provider.clone(), env.ledger().timestamp());
+        let prep_data = PrepareRecordAddition {
+            caller: caller.clone(),
+            patient: patient.clone(),
+            provider: provider.clone(),
+            record_type: record_type.clone(),
+            data_hash: data_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for add_record operation
+    pub fn commit_add_record(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        provider: Address,
+        record_type: RecordType,
+        data_hash: String,
+    ) -> Result<u64, ContractError> {
+        // Retrieve preparation data using timestamp lookup
+        let prep_keys = env.storage().temporary().range::<_, PrepareRecordAddition>();
+        let mut prep_data: Option<PrepareRecordAddition> = None;
+        let mut prep_key_to_remove: Option<(Symbol, Address, u64)> = None;
+
+        for key in prep_keys {
+            if let Ok((_, data)) = key {
+                if data.caller == caller && data.patient == patient && 
+                   data.provider == provider && data.record_type == record_type && 
+                   data.data_hash == data_hash {
+                    prep_data = Some(data);
+                    prep_key_to_remove = Some(key);
+                    break;
+                }
             }
         }
-        // 3. Fall back to RBAC SystemAdmin
-        rbac::has_permission(env, caller, &Permission::SystemAdmin)
-    }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cross-chain export helpers
-//
-// These are free `pub fn`s (not contract entrypoints) so that crates such as
-// `cross_chain` can import `vision_records` as a library dependency and invoke
-// them directly with a shared `Env`.  They honour every existing auth rule.
-// ─────────────────────────────────────────────────────────────────────────────
+        let prep_data = prep_data.ok_or(ContractError::InvalidPhase)?;
 
-/// Decodes the internal `u64` record counter key from a cross-chain
-/// `BytesN<32>` identifier.
-///
-/// Convention: the serialised `u64` occupies the **last 8 bytes** (big-endian)
-/// of the 32-byte ID.  The remaining 24 bytes may carry chain / namespace
-/// context and are ignored here.
-fn export_internal_record_id(record_id: &BytesN<32>) -> u64 {
-    let raw = record_id.to_array();
-    u64::from_be_bytes([
-        raw[24], raw[25], raw[26], raw[27], raw[28], raw[29], raw[30], raw[31],
-    ])
-}
+        // Execute the actual record addition
+        let record_id = increment_record_counter(&env);
+        let record = VisionRecord {
+            id: record_id,
+            patient: patient.clone(),
+            provider: provider.clone(),
+            record_type: record_type.clone(),
+            data_hash: data_hash.clone(),
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            access_count: 0,
+        };
 
-/// Internal access check shared by both export helpers.
-///
-/// Returns `Ok(VisionRecord)` when the caller is authorised, or a
-/// `ContractError` otherwise.  Mirrors the rule-set from
-/// [`VisionRecordsContract::get_record`] without duplicating audit logging.
-fn export_check_access(
-    env: &Env,
-    caller: &Address,
-    rid: u64,
-) -> Result<VisionRecord, ContractError> {
-    let key = (symbol_short!("RECORD"), rid);
-    let record: VisionRecord = env
-        .storage()
-        .persistent()
-        .get::<_, VisionRecord>(&key)
-        .ok_or(ContractError::RecordNotFound)?;
+        let key = (symbol_short!("RECORD"), record_id);
+        env.storage().persistent().set(&key, &record);
+        extend_ttl_record_key(&env, &key);
 
-    // Patient and the originating provider are always allowed.
-    if *caller == record.patient || *caller == record.provider {
-        return Ok(record);
-    }
-
-    // Broad RBAC permissions (ReadAnyRecord or SystemAdmin).
-    if rbac::has_permission(env, caller, &Permission::ReadAnyRecord)
-        || rbac::has_permission(env, caller, &Permission::SystemAdmin)
-    {
-        return Ok(record);
-    }
-
-    // Active patient-to-caller consent grant.
-    if has_active_consent(env, &record.patient, caller) {
-        return Ok(record);
-    }
-
-    // Patient-level AccessGrant (symbol_short!("ACCESS"), patient, grantee).
-    let patient_grant_key = (
-        symbol_short!("ACCESS"),
-        record.patient.clone(),
-        caller.clone(),
-    );
-    if let Some(grant) = env
-        .storage()
-        .persistent()
-        .get::<_, AccessGrant>(&patient_grant_key)
-    {
-        if grant.level != AccessLevel::None && grant.expires_at > env.ledger().timestamp() {
-            return Ok(record);
+        // Clean up preparation data
+        if let Some(key) = prep_key_to_remove {
+            env.storage().temporary().remove(&key);
         }
+
+        events::publish_record_added(&env, record_id, patient, provider, record_type);
+
+        Ok(record_id)
     }
 
-    // Record-level AccessGrant (symbol_short!("REC_ACC"), record_id, grantee).
-    let rec_grant_key = (symbol_short!("REC_ACC"), rid, caller.clone());
-    if let Some(grant) = env
-        .storage()
-        .persistent()
-        .get::<_, AccessGrant>(&rec_grant_key)
-    {
-        if grant.level != AccessLevel::None && grant.expires_at > env.ledger().timestamp() {
-            return Ok(record);
+    /// Rollback for add_record operation
+    pub fn rollback_add_record(
+        env: Env,
+        _caller: Address,
+        _patient: Address,
+        provider: Address,
+        _record_type: RecordType,
+        _data_hash: String,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data for this provider
+        let prep_keys = env.storage().temporary().range::<_, PrepareRecordAddition>();
+        for key in prep_keys {
+            if let Ok((_, data)) = key {
+                if data.provider == provider {
+                    env.storage().temporary().remove(&key);
+                }
+            }
         }
+
+        Ok(())
     }
 
-    Err(ContractError::Unauthorized)
-}
+    // ======================== Two-Phase Commit Hooks ========================
 
-/// Prepares a vision record for cross-chain export.
-///
-/// Loads the `VisionRecord` identified by `record_id`, verifies that `caller`
-/// has read access under the existing RBAC / consent / grant rules, then
-/// returns:
-///
-/// * `record_data` – the full record serialised to XDR `Bytes` (the
-///   content-addressed blob handed to the Merkle tree).
-/// * `fields` – a `Vec` of `(field_name: Symbol, field_bytes: Bytes)` pairs
-///   suitable for per-field Merkle-tree insertion and selective disclosure.
-///   Core `VisionRecord` fields are always included; `EyeExamination` fields
-///   are appended when an examination exists for the record.
-///
-/// # Access control
-/// `caller.require_auth()` is enforced unconditionally.  The caller must then
-/// be the record's `patient`, the record's `provider`, hold the
-/// `ReadAnyRecord` or `SystemAdmin` RBAC permission, or possess a valid
-/// consent / access grant – exactly as [`VisionRecordsContract::get_record`].
-///
-/// # Errors
-/// * [`ContractError::RecordNotFound`] – no record with that ID exists.
-/// * [`ContractError::Unauthorized`]  – caller lacks read permission.
-pub fn prepare_record_for_export(
-    env: &Env,
-    caller: &Address,
-    record_id: &BytesN<32>,
-) -> Result<(Bytes, Vec<(Symbol, Bytes)>), ContractError> {
-    caller.require_auth();
+    /// Prepare phase for adding a vision record
+    pub fn prepare_add_record(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        provider: Address,
+        record_type: RecordType,
+        data_hash: String,
+    ) -> Result<u64, ContractError> {
+        // Validate all inputs without making state changes
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("ADD_REC")),
+        )?;
 
-    let rid = export_internal_record_id(record_id);
-    let record = export_check_access(env, caller, rid)?;
+        if !whitelist::check_whitelist_access(&env, &caller) {
+            return Err(ContractError::Unauthorized);
+        }
 
-    // ── Serialise the full record to a deterministic byte blob ───────────────
-    // We build the blob by concatenating the record's stable textual fields;
-    // this gives the cross-chain bridge a stable, hash-able payload without
-    // requiring XDR encoding (which is test-only in this SDK version).
-    let mut blob = alloc::vec::Vec::<u8>::new();
-    blob.extend_from_slice(&record.id.to_be_bytes());
-    blob.extend_from_slice(record.data_hash.to_string().as_bytes());
-    blob.extend_from_slice(&record.created_at.to_be_bytes());
-    blob.extend_from_slice(&record.updated_at.to_be_bytes());
-    let record_data = Bytes::from_slice(env, &blob);
+        Self::enforce_rate_limit(&env, &caller)?;
+        validation::validate_data_hash(&data_hash)?;
 
-    // ── Build per-field (name, bytes) pairs ──────────────────────────────────
-    let mut fields: Vec<(Symbol, Bytes)> = Vec::new(env);
+        // Check permissions
+        let has_perm = if caller == provider {
+            rbac::has_permission(&env, &caller, &Permission::WriteRecord)
+        } else {
+            rbac::has_delegated_permission(&env, &provider, &caller, &Permission::WriteRecord)
+        };
 
-    // Core VisionRecord fields
-    fields.push_back((
-        symbol_short!("data_hash"),
-        Bytes::from_slice(env, record.data_hash.to_string().as_bytes()),
-    ));
-    // RecordType discriminant serialised as a 4-byte big-endian value
-    let rec_type_disc: u32 = match record.record_type {
-        RecordType::Examination  => 0,
-        RecordType::Prescription => 1,
-        RecordType::Diagnosis    => 2,
-        RecordType::Treatment    => 3,
-        RecordType::Surgery      => 4,
-        RecordType::LabResult    => 5,
-    };
-    fields.push_back((
-        symbol_short!("rec_type"),
-        Bytes::from_array(env, &rec_type_disc.to_be_bytes()),
-    ));
-    fields.push_back((
-        symbol_short!("created"),
-        Bytes::from_array(env, &record.created_at.to_be_bytes()),
-    ));
-    fields.push_back((
-        symbol_short!("updated"),
-        Bytes::from_array(env, &record.updated_at.to_be_bytes()),
-    ));
+        if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
 
-    // EyeExamination fields (present only for Examination-type records)
-    if let Some(exam) = examination::get_examination(env, rid) {
-        fields.push_back((
-            symbol_short!("va_l"),
-            Bytes::from_slice(env, exam.visual_acuity.uncorrected.left_eye.to_string().as_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("va_r"),
-            Bytes::from_slice(env, exam.visual_acuity.uncorrected.right_eye.to_string().as_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("iop_l"),
-            Bytes::from_array(env, &exam.iop.left_eye.to_be_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("iop_r"),
-            Bytes::from_array(env, &exam.iop.right_eye.to_be_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("iop_meth"),
-            Bytes::from_slice(env, exam.iop.method.to_string().as_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("slit_cor"),
-            Bytes::from_slice(env, exam.slit_lamp.cornea.to_string().as_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("slit_len"),
-            Bytes::from_slice(env, exam.slit_lamp.lens.to_string().as_bytes()),
-        ));
-        fields.push_back((
-            symbol_short!("cl_notes"),
-            Bytes::from_slice(env, exam.clinical_notes.to_string().as_bytes()),
-        ));
+        // Generate and return the record ID that will be used
+        let counter_key = symbol_short!("REC_CTR");
+        let record_id: u64 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+
+        // Store preparation data temporarily
+        let prep_key = (symbol_short!("PREP_ADD_REC"), record_id);
+        let prep_data = PrepareAddRecord {
+            caller,
+            patient,
+            provider,
+            record_type,
+            data_hash,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(record_id)
     }
 
-    Ok((record_data, fields))
-}
+    /// Commit phase for adding a vision record
+    pub fn commit_add_record(
+        env: Env,
+        record_id: u64,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_ADD_REC"), record_id);
+        let prep_data: PrepareAddRecord = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
 
-/// Returns the list of field names available for selective disclosure on a
-/// given record.
-///
-/// The returned `Vec<Symbol>` mirrors exactly the `field_name` entries that
-/// [`prepare_record_for_export`] would populate for the same record, so that
-/// the cross-chain bridge (or any client) can build a selective-disclosure
-/// request without having to call `prepare_record_for_export` first.
-///
-/// # Access control
-/// Same rules as [`prepare_record_for_export`]: `caller.require_auth()` is
-/// unconditionally enforced; the caller must be patient, provider, or hold an
-/// appropriate RBAC permission / grant.
-///
-/// # Errors
-/// * [`ContractError::RecordNotFound`] – no record with that ID exists.
-/// * [`ContractError::Unauthorized`]  – caller lacks read permission.
-pub fn get_exportable_fields(
-    env: &Env,
-    caller: &Address,
-    record_id: &BytesN<32>,
-) -> Result<Vec<Symbol>, ContractError> {
-    caller.require_auth();
+        // Update the counter
+        let counter_key = symbol_short!("REC_CTR");
+        env.storage().instance().set(&counter_key, &record_id);
 
-    let rid = export_internal_record_id(record_id);
-    let record = export_check_access(env, caller, rid)?;
+        // Create the actual record
+        let record = VisionRecord {
+            id: record_id,
+            patient: prep_data.patient.clone(),
+            provider: prep_data.provider.clone(),
+            record_type: prep_data.record_type.clone(),
+            data_hash: prep_data.data_hash.clone(),
+            created_at: prep_data.timestamp,
+            updated_at: prep_data.timestamp,
+        };
 
-    let mut names: Vec<Symbol> = Vec::new(env);
+        // Store the record
+        let key = (symbol_short!("RECORD"), record_id);
+        env.storage().persistent().set(&key, &record);
+        extend_ttl_u64_key(&env, &key);
 
-    // Core VisionRecord fields – always present
-    names.push_back(symbol_short!("data_hash"));
-    names.push_back(symbol_short!("rec_type"));
-    names.push_back(symbol_short!("patient"));
-    names.push_back(symbol_short!("provider"));
-    names.push_back(symbol_short!("created"));
-    names.push_back(symbol_short!("updated"));
+        // Add to patient's record list
+        let patient_key = (symbol_short!("PAT_REC"), prep_data.patient.clone());
+        let mut patient_records: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&patient_key)
+            .unwrap_or(Vec::new(&env));
+        patient_records.push_back(record_id);
+        env.storage()
+            .persistent()
+            .set(&patient_key, &patient_records);
+        extend_ttl_address_key(&env, &patient_key);
 
-    // EyeExamination fields – present only when an examination exists
-    if examination::get_examination(env, rid).is_some() {
-        names.push_back(symbol_short!("va_l"));
-        names.push_back(symbol_short!("va_r"));
-        names.push_back(symbol_short!("iop_l"));
-        names.push_back(symbol_short!("iop_r"));
-        names.push_back(symbol_short!("iop_meth"));
-        names.push_back(symbol_short!("slit_cor"));
-        names.push_back(symbol_short!("slit_len"));
-        names.push_back(symbol_short!("cl_notes"));
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
     }
 
-    // Silence the unused-variable warning from the access-checked record
-    let _ = record;
+    /// Rollback phase for adding a vision record
+    pub fn rollback_add_record(
+        env: Env,
+        record_id: u64,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_ADD_REC"), record_id);
+        env.storage().temporary().remove(&prep_key);
 
-    Ok(names)
+        Ok(())
+    }
+
+    /// Prepare phase for granting access
+    pub fn prepare_grant_access(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        grantee: Address,
+        access_level: AccessLevel,
+        expires_at: Option<u64>,
+    ) -> Result<(), ContractError> {
+        // Validate inputs without state changes
+        if caller != patient && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if access_level == AccessLevel::None {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Store preparation data
+        let prep_key = (symbol_short!("PREP_GRANT_ACC"), patient.clone(), grantee.clone());
+        let prep_data = PrepareGrantAccess {
+            caller,
+            patient,
+            grantee,
+            access_level,
+            expires_at,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(())
+    }
+
+    /// Commit phase for granting access
+    pub fn commit_grant_access(
+        env: Env,
+        patient: Address,
+        grantee: Address,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_GRANT_ACC"), patient.clone(), grantee.clone());
+        let prep_data: PrepareGrantAccess = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Create the access grant
+        let grant = AccessGrant {
+            patient: prep_data.patient.clone(),
+            grantee: prep_data.grantee.clone(),
+            level: prep_data.access_level,
+            granted_at: prep_data.timestamp,
+            expires_at: prep_data.expires_at.unwrap_or(0),
+        };
+
+        // Store the grant
+        let key = (symbol_short!("GRANT"), prep_data.patient.clone(), prep_data.grantee.clone());
+        env.storage().persistent().set(&key, &grant);
+        extend_ttl_address_key(&env, &key);
+
+        // Add to patient's grants list
+        let grants_key = (symbol_short!("GRANTS"), prep_data.patient.clone());
+        let mut grants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&grants_key)
+            .unwrap_or(Vec::new(&env));
+        
+        if !grants.contains(&prep_data.grantee) {
+            grants.push_back(prep_data.grantee.clone());
+            env.storage().persistent().set(&grants_key, &grants);
+            extend_ttl_address_key(&env, &grants_key);
+        }
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Rollback phase for granting access
+    pub fn rollback_grant_access(
+        env: Env,
+        patient: Address,
+        grantee: Address,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_GRANT_ACC"), patient.clone(), grantee.clone());
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Prepare phase for adding a prescription
+    pub fn prepare_add_prescription(
+        env: Env,
+        patient: Address,
+        provider: Address,
+        prescription_data: prescription::PrescriptionData,
+    ) -> Result<u64, ContractError> {
+        // Validate without state changes
+        validation::validate_prescription_data(&prescription_data)?;
+
+        // Check provider permissions
+        let caller = provider.clone();
+        let has_perm = rbac::has_permission(&env, &caller, &Permission::WriteRecord) ||
+                      rbac::has_delegated_permission(&env, &provider, &caller, &Permission::WriteRecord) ||
+                      rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
+
+        if !has_perm {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Generate prescription ID
+        let counter_key = symbol_short!("RX_CTR");
+        let rx_id: u64 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+
+        // Store preparation data
+        let prep_key = (symbol_short!("PREP_ADD_RX"), rx_id);
+        let prep_data = PrepareAddPrescription {
+            patient,
+            provider,
+            prescription_data,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(rx_id)
+    }
+
+    /// Commit phase for adding a prescription
+    pub fn commit_add_prescription(
+        env: Env,
+        rx_id: u64,
+    ) -> Result<(), ContractError> {
+        // Retrieve preparation data
+        let prep_key = (symbol_short!("PREP_ADD_RX"), rx_id);
+        let prep_data: PrepareAddPrescription = env.storage().temporary()
+            .get(&prep_key)
+            .ok_or(ContractError::InvalidInput)?;
+
+        // Update counter
+        let counter_key = symbol_short!("RX_CTR");
+        env.storage().instance().set(&counter_key, &rx_id);
+
+        // Create the prescription
+        let prescription = prescription::Prescription {
+            id: rx_id,
+            patient: prep_data.patient.clone(),
+            provider: prep_data.provider.clone(),
+            data: prep_data.prescription_data.clone(),
+            created_at: prep_data.timestamp,
+            verified: false,
+        };
+
+        // Store the prescription
+        let key = (symbol_short!("PRESCRIPTION"), rx_id);
+        env.storage().persistent().set(&key, &prescription);
+        extend_ttl_u64_key(&env, &key);
+
+        // Add to patient's prescription history
+        prescription::add_to_patient_history(&env, prep_data.patient.clone(), rx_id);
+
+        // Clean up preparation data
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
+
+    /// Rollback phase for adding a prescription
+    pub fn rollback_add_prescription(
+        env: Env,
+        rx_id: u64,
+    ) -> Result<(), ContractError> {
+        // Clean up preparation data
+        let prep_key = (symbol_short!("PREP_ADD_RX"), rx_id);
+        env.storage().temporary().remove(&prep_key);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

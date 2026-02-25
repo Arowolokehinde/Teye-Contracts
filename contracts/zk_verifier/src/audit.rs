@@ -120,4 +120,17 @@ impl AuditTrail {
 
         true
     }
+
+    pub fn log_verification(env: &Env, submitter: &Address, proof_id: u64, verified: bool) {
+        let record = VerificationRecord {
+            submitter: submitter.clone(),
+            proof_id,
+            verified,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&("verification", proof_id), &record);
+        env.events().publish(("verification", proof_id), (submitter, verified));
+    }
 }

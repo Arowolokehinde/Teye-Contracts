@@ -40,6 +40,7 @@ pub mod session;
 pub mod risk_engine;
 pub mod vector_clock;
 pub mod whitelist;
+pub mod transaction;
 
 pub mod credential_types;
 

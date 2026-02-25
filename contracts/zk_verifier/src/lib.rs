@@ -63,13 +63,17 @@ pub struct AccessRequest {
     pub proof: Proof,
     /// Public inputs associated with the proof.
     pub public_inputs: Vec<BytesN<32>>,
-    /// Strictly-monotonic per-sender nonce for replay protection.
-    /// Must equal the value currently stored for `user`; incremented on success.
-    pub nonce: u64,
+    pub timestamp: u64,
 }
 
-/// Contract errors for the ZK verifier.
-#[contracterror]
+/// Storage keys (all ≤9 chars for symbol_short!)
+const ADMIN: Symbol = symbol_short!("ADMIN");
+const INITIALIZED: Symbol = symbol_short!("INIT");
+const PROOF_CTR: Symbol = symbol_short!("PROOF_CTR");
+const VFY_RES: Symbol = symbol_short!("VFY_RES");
+
+/// Contract error codes
+#[soroban_sdk::contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
@@ -185,15 +189,15 @@ fn validate_level4_attributes(request: &AccessRequest) -> Result<(), ContractErr
 
 #[contractimpl]
 impl ZkVerifierContract {
-    /// One-time initialization to set the admin address.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&ADMIN) {
-            return;
+    /// Initialize the zk verifier contract
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        if env.storage().instance().has(&INITIALIZED) {
+            return Err(ContractError::AlreadyInitialized);
         }
 
-        admin.require_auth();
         env.storage().instance().set(&ADMIN, &admin);
-    }
+        env.storage().instance().set(&INITIALIZED, &true);
+        env.storage().instance().set(&PROOF_CTR, &0u64);
 
     /// Store the Groth16 verification key used by `verify_access`.
     ///
@@ -311,12 +315,17 @@ impl ZkVerifierContract {
             return Err(ContractError::InvalidConfig);
         }
 
-        env.storage().instance().set(
-            &RATE_CFG,
-            &(max_requests_per_window, window_duration_seconds),
-        );
+        let mut proof_ids = Vec::new(&env);
 
-        Ok(())
+        for i in 0..proofs.len() {
+            let proof = proofs.get(i).unwrap().clone();
+            let public_inputs = public_inputs_batch.get(i).unwrap().clone();
+
+            let proof_id = Self::verify_proof(env.clone(), submitter.clone(), proof, public_inputs)?;
+            proof_ids.push_back(proof_id);
+        }
+
+        Ok(proof_ids)
     }
 
     /// Sets the ZK Verification Key for Groth16.
@@ -368,12 +377,44 @@ impl ZkVerifierContract {
         Ok(())
     }
 
-    pub fn is_whitelist_enabled(env: Env) -> bool {
-        whitelist::is_whitelist_enabled(&env)
+    /// Check if contract is initialized
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().instance().has(&INITIALIZED)
     }
 
-    pub fn is_whitelisted(env: Env, user: Address) -> bool {
-        whitelist::is_whitelisted(&env, &user)
+    // ======================== Two-Phase Commit Hooks ========================
+
+    /// Prepare phase for proof verification
+    pub fn prepare_verify_proof(
+        env: Env,
+        submitter: Address,
+        proof: Proof,
+        public_inputs: Vec<BytesN<32>>,
+    ) -> Result<u64, ContractError> {
+        Self::require_initialized(&env)?;
+
+        if public_inputs.is_empty() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&PROOF_CTR)
+            .unwrap_or(0u64)
+            .saturating_add(1u64);
+
+        let prep_key = (symbol_short!("PREP_VFY"), proof_id);
+        let prep_data = PrepareVerification {
+            proof_id,
+            submitter: submitter.clone(),
+            proof: proof.clone(),
+            public_inputs: public_inputs.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().temporary().set(&prep_key, &prep_data);
+
+        Ok(proof_id)
     }
 
     pub fn get_nonce(env: Env, user: Address) -> u64 {
@@ -388,30 +429,65 @@ impl ZkVerifierContract {
             None => return Ok(()),
         };
 
-        if max_requests_per_window == 0 || window_duration_seconds == 0 {
-            return Ok(());
-        }
+        let key = (VFY_RES, proof_id);
+        env.storage().persistent().set(&key, &result);
 
-        let now = env.ledger().timestamp();
-        let key = (RATE_TRACK, user.clone());
+        audit::AuditTrail::log_verification(&env, &prep_data.submitter, proof_id, verified);
 
-        let mut state: (u64, u64) = env.storage().persistent().get(&key).unwrap_or((0, now));
-
-        let window_end = state.1.saturating_add(window_duration_seconds);
-        if now >= window_end {
-            state.0 = 0;
-            state.1 = now;
-        }
-
-        let next = state.0.saturating_add(1);
-        if next > max_requests_per_window {
-            return Err(ContractError::RateLimited);
-        }
-
-        state.0 = next;
-        env.storage().persistent().set(&key, &state);
+        env.storage().temporary().remove(&prep_key);
 
         Ok(())
+    }
+
+    /// Rollback phase for proof verification
+    pub fn rollback_verify_proof(env: Env, proof_id: u64) -> Result<(), ContractError> {
+        let prep_key = (symbol_short!("PREP_VFY"), proof_id);
+        env.storage().temporary().remove(&prep_key);
+        Ok(())
+    }
+
+    /// Prepare phase for batch verification
+    pub fn prepare_batch_verify_proofs(
+        env: Env,
+        submitter: Address,
+        proofs: Vec<Proof>,
+        public_inputs_batch: Vec<Vec<BytesN<32>>>,
+    ) -> Result<Vec<u64>, ContractError> {
+        Self::require_initialized(&env)?;
+
+        if proofs.len() != public_inputs_batch.len() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let mut proof_ids = Vec::new(&env);
+        let mut start_proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&PROOF_CTR)
+            .unwrap_or(0u64);
+
+        for i in 0..proofs.len() {
+            let public_inputs = public_inputs_batch.get(i).unwrap().clone();
+
+            if public_inputs.is_empty() {
+                return Err(ContractError::InvalidInput);
+            }
+
+            start_proof_id = start_proof_id.saturating_add(1);
+            proof_ids.push_back(start_proof_id);
+
+            let prep_key = (symbol_short!("PREP_BVF"), start_proof_id);
+            let prep_data = PrepareVerification {
+                proof_id: start_proof_id,
+                submitter: submitter.clone(),
+                proof: proofs.get(i).unwrap().clone(),
+                public_inputs,
+                timestamp: env.ledger().timestamp(),
+            };
+            env.storage().temporary().set(&prep_key, &prep_data);
+        }
+
+        Ok(proof_ids)
     }
 
     fn validate_and_increment_nonce(
@@ -506,7 +582,7 @@ impl ZkVerifierContract {
                 "valid_groth16_proof",
             );
         }
-        Ok(is_valid)
+        Ok(())
     }
 
     /// Verifies access with auth-level-aware ZK requirements.
