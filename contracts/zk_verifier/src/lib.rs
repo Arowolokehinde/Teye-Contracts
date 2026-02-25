@@ -532,6 +532,16 @@ impl ZkVerifierContract {
         AuditTrail::get_record(&env, user, resource_id)
     }
 
+    /// Verifies access for a delegated computation.
+    /// This allows off-chain executors to verify proofs on behalf of users.
+    pub fn verify_delegated_access(
+        env: Env,
+        executor: Address,
+        request: AccessRequest,
+    ) -> Result<bool, ContractError> {
+        executor.require_auth();
+        // Additional checks for authorized executors can be added here
+        Self::verify_access(env, request)
     /// Verifies the integrity of the audit chain for a given user and resource.
     ///
     /// Returns `true` if all hash links are valid, or if the chain is empty.
