@@ -1985,8 +1985,10 @@ dependencies = [
 name = "vision_records"
 version = "1.2.2"
 dependencies = [
+ "audit",
  "common",
  "ed25519-dalek",
+ "key_manager",
  "proptest",
  "proptest-derive",
  "soroban-sdk",
