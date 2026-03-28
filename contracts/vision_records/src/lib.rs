@@ -21,15 +21,21 @@ pub mod rate_limit;
 pub mod rbac;
 pub mod validation;
 
+use key_manager::{DerivedKey, KeyManagerContractClient};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String,
     Symbol, Vec,
 };
 
+use teye_common::lineage::{self, RelationshipKind};
+use teye_common::provenance_graph::{self, LineageAccessResult, ProvenanceExport};
+use teye_common::state_machine::{
+    self, EntityKind, LifecycleState, TransitionContext, TransitionRecord,
+};
 use teye_common::{
     admin_tiers, concurrency::ConflictEntry, concurrency::FieldChange,
-    concurrency::ResolutionStrategy, multisig, progressive_auth, risk_engine, whitelist, AdminTier,
-    KeyManager, MeteringOpType, UpdateOutcome, VersionStamp,
+    concurrency::ResolutionStrategy, multisig, progressive_auth, risk_engine, session, whitelist,
+    AdminTier, KeyManager, MeteringOpType, UpdateOutcome, VersionStamp,
 };
 
 /// Re-export the contract-specific error type at the crate root.
@@ -116,6 +122,7 @@ fn rate_limit_action_hash(
     env.crypto().sha256(&payload).into()
 }
 
+#[allow(dead_code)]
 fn encryption_key_action_hash(env: &Env, version: &String, key: &String) -> BytesN<32> {
     let mut payload = Bytes::new(env);
     payload.append(&Bytes::from_slice(env, b"SET_ENC"));
@@ -160,6 +167,7 @@ pub enum AccessLevel {
     None,
     Read,
     Write,
+    Full,
     Admin,
 }
 
@@ -362,6 +370,7 @@ impl VisionRecordsContract {
         }
     }
 
+    #[allow(dead_code)]
     fn derive_key_manager_bytes(
         env: &Env,
         record_id: u64,
@@ -382,6 +391,7 @@ impl VisionRecordsContract {
         Ok(Some((bytes, String::from_str(env, &version_str))))
     }
 
+    #[allow(dead_code)]
     fn parse_key_version_u32(version: &String) -> Option<u32> {
         version.to_string().parse::<u32>().ok()
     }
@@ -862,7 +872,7 @@ impl VisionRecordsContract {
 
         let user_data = User {
             address: user.clone(),
-            role: role.clone(),
+            role,
             name: name.clone(),
             registered_at: env.ledger().timestamp(),
             is_active: true,
@@ -871,15 +881,15 @@ impl VisionRecordsContract {
         let key = (symbol_short!("USER"), user.clone());
         env.storage().persistent().set(&key, &user_data);
         extend_ttl_address_key(&env, &key);
-        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+        rbac::assign_role(&env, user.clone(), role, 0);
 
-        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+        rbac::assign_role(&env, user.clone(), role, 0);
 
         // Assign the role in the RBAC system
-        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+        rbac::assign_role(&env, user.clone(), role, 0);
 
         // Create the RBAC role assignment so has_permission works
-        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+        rbac::assign_role(&env, user.clone(), role, 0);
 
         events::publish_user_registered(&env, user, role, name);
 
@@ -989,7 +999,7 @@ impl VisionRecordsContract {
 
         // Determine current encryption key version (if any) and load master bytes
         let current_version: Option<String> = env.storage().instance().get(&ENC_CUR);
-        let mut master_bytes = soroban_sdk::Bytes::new(&env);
+        let mut master_bytes: StdVec<u8> = StdVec::new();
         if let Some(ver) = current_version.clone() {
             if let Some(sv) = env
                 .storage()
@@ -1001,10 +1011,13 @@ impl VisionRecordsContract {
                     master_bytes = bytes;
                 }
             }
-        } // Build KeyManager and encrypt the provided data_hash
+        }
+        // Build KeyManager and encrypt the provided data_hash
         let km = KeyManager::new(master_bytes);
-        let ciphertext = km.encrypt(&env, data_hash.clone());
-        let stored_hash = ciphertext;
+        let plaintext: StdString = data_hash.to_string();
+        let ciphertext = km.encrypt(None, &plaintext);
+        let stored_hash = String::from_str(&env, &ciphertext);
+        let key_version = current_version;
 
         let record = VisionRecord {
             id: record_id,
@@ -1039,6 +1052,16 @@ impl VisionRecordsContract {
 
         // Initialize OCC version tracking
         teye_common::concurrency::init_record_version(&env, record_id, 1);
+
+        let _ = lineage::create_node(&env, record_id, provider.clone(), "VisionRecord", None);
+        let _ = lineage::add_edge(
+            &env,
+            record_id,
+            record_id,
+            RelationshipKind::Created,
+            provider.clone(),
+            None,
+        );
 
         Ok(record_id)
     }
@@ -1080,7 +1103,6 @@ impl VisionRecordsContract {
 
         // Load current encryption key/version once for the batch
         let current_version: Option<String> = env.storage().instance().get(&ENC_CUR);
-        let mut master_bytes_batch = soroban_sdk::Bytes::new(&env);
         let key_manager_cfg = Self::get_key_manager_config(&env);
         let key_manager_client = key_manager_cfg
             .as_ref()
@@ -1102,10 +1124,6 @@ impl VisionRecordsContract {
         for input in records.iter() {
             current_id += 1;
 
-            // Encrypt input.data_hash with batch master
-            let km = KeyManager::new(master_bytes_batch.clone());
-            let ciphertext = km.encrypt(&env, input.data_hash.clone());
-            let stored_hash = ciphertext;
             let mut master_bytes = master_bytes_batch.clone();
             let mut key_version = current_version.clone();
             if let Some((_, key_id)) = key_manager_cfg.as_ref() {
@@ -1159,6 +1177,16 @@ impl VisionRecordsContract {
             record_ids.push_back(current_id);
             // Initialize OCC version tracking
             teye_common::concurrency::init_record_version(&env, current_id, 1);
+
+            let _ = lineage::create_node(&env, current_id, provider.clone(), "VisionRecord", None);
+            let _ = lineage::add_edge(
+                &env,
+                current_id,
+                current_id,
+                RelationshipKind::Created,
+                provider.clone(),
+                None,
+            );
         }
 
         env.storage().instance().set(&counter_key, &current_id);
@@ -1240,8 +1268,6 @@ impl VisionRecordsContract {
                     .key_version
                     .clone()
                     .or_else(|| env.storage().instance().get(&ENC_CUR));
-                let mut master_bytes = soroban_sdk::Bytes::new(&env);
-                // Prefer KeyManager-derived key when configured; fallback to ENC_KEY
                 let mut master_bytes: StdVec<u8> = StdVec::new();
                 if let Some(ver) = key_ver {
                     if let Some(sv) = env
@@ -1252,34 +1278,15 @@ impl VisionRecordsContract {
                         let hex = sv.to_string();
                         if let Some(bytes) = teye_common::hex_to_bytes(&hex) {
                             master_bytes = bytes;
-                            used_key_manager = true;
-                        }
-                    }
-                }
-
-                if !used_key_manager {
-                    let key_ver = out_record
-                        .key_version
-                        .clone()
-                        .or_else(|| env.storage().instance().get(&ENC_CUR));
-                    if let Some(ver) = key_ver {
-                        if let Some(sv) = env
-                            .storage()
-                            .persistent()
-                            .get::<(Symbol, String), String>(&(ENC_KEY, ver.clone()))
-                        {
-                            let hex = sv.to_string();
-                            if let Some(bytes) = teye_common::hex_to_bytes(&hex) {
-                                master_bytes = bytes;
-                            }
                         }
                     }
                 }
 
                 if !master_bytes.is_empty() || out_record.key_version.is_none() {
                     let km = KeyManager::new(master_bytes);
-                    if let Some(plain) = km.decrypt(&env, out_record.data_hash.clone()) {
-                        out_record.data_hash = plain;
+                    let ciphertext = out_record.data_hash.to_string();
+                    if let Some(plain) = km.decrypt(None, &ciphertext) {
+                        out_record.data_hash = String::from_str(&env, &plain);
                     }
                 }
 
@@ -1374,7 +1381,7 @@ impl VisionRecordsContract {
             clinical_notes,
         };
 
-        examination::set_examination(&env, &exam);
+        examination::set_examination(&env, &exam, &caller);
 
         audit::AuditManager::log_event(
             &env,
@@ -1475,6 +1482,7 @@ impl VisionRecordsContract {
             access == AccessLevel::Read
                 || access == AccessLevel::Write
                 || access == AccessLevel::Full
+                || access == AccessLevel::Admin
                 || record_access != AccessLevel::None
                 || rbac::has_permission(&env, &caller, &Permission::SystemAdmin)
         };
@@ -1677,7 +1685,28 @@ impl VisionRecordsContract {
             env.storage().persistent().set(&list_key, &grantees);
         }
 
-        events::publish_access_granted(&env, patient, grantee, level, duration_seconds, expires_at);
+        events::publish_access_granted(
+            &env,
+            patient.clone(),
+            grantee.clone(),
+            level,
+            duration_seconds,
+            expires_at,
+        );
+
+        let record_ids = Self::get_patient_records(env.clone(), patient.clone());
+        for i in 0..record_ids.len() {
+            if let Some(record_id) = record_ids.get(i) {
+                let _ = lineage::add_edge(
+                    &env,
+                    record_id,
+                    record_id,
+                    RelationshipKind::SharedWith,
+                    grantee.clone(),
+                    None,
+                );
+            }
+        }
 
         Ok(())
     }
@@ -1897,17 +1926,6 @@ impl VisionRecordsContract {
         let key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
         env.storage().persistent().remove(&key);
 
-        let revoked_delegations = rbac::revoke_delegations_from(&env, &grantee);
-        for revoked in revoked_delegations.iter() {
-            events::publish_cascading_revocation(
-                &env,
-                patient.clone(),
-                grantee.clone(),
-                revoked.delegatee.clone(),
-                revoked.is_scoped,
-            );
-        }
-
         // Log successful access revoke
         let audit_entry = audit::create_audit_entry(
             &env,
@@ -1920,9 +1938,6 @@ impl VisionRecordsContract {
         );
         audit::add_audit_entry(&env, &audit_entry);
         events::publish_audit_log_entry(&env, &audit_entry);
-
-        env.storage().persistent().set(&profile_key, &profile);
-        events::publish_profile_updated(&env, patient);
 
         Ok(())
     }
@@ -2206,7 +2221,7 @@ impl VisionRecordsContract {
         caller: Address,
         policy_id: String,
         name: String,
-        required_role: Option<Role>,
+        required_role: Role,
         time_restriction: TimeRestriction,
         required_credential: CredentialType,
         min_sensitivity_level: SensitivityLevel,
@@ -2283,7 +2298,7 @@ impl VisionRecordsContract {
             return Err(ContractError::Unauthorized);
         }
 
-        rbac::set_record_sensitivity(&env, record_id, sensitivity.clone());
+        rbac::set_record_sensitivity(&env, record_id, sensitivity);
         events::publish_sensitivity_set(&env, record_id, sensitivity, caller);
 
         Ok(())
@@ -2325,7 +2340,7 @@ impl VisionRecordsContract {
         let prep_data = PrepareUserRegistration {
             caller: caller.clone(),
             user: user.clone(),
-            role: role.clone(),
+            role,
             name: name.clone(),
             timestamp: env.ledger().timestamp(),
         };
@@ -2362,7 +2377,7 @@ impl VisionRecordsContract {
         // Execute the actual registration
         let user_data = User {
             address: user.clone(),
-            role: role.clone(),
+            role,
             name: name.clone(),
             registered_at: env.ledger().timestamp(),
             is_active: true,
@@ -2371,7 +2386,7 @@ impl VisionRecordsContract {
         let key = (symbol_short!("USER"), user.clone());
         env.storage().persistent().set(&key, &user_data);
         extend_ttl_address_key(&env, &key);
-        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+        rbac::assign_role(&env, user.clone(), role, 0);
 
         // Clean up preparation data
         env.storage().temporary().remove(&prep_key);
@@ -2576,7 +2591,7 @@ impl VisionRecordsContract {
             prep_data.grantee.clone(),
         );
         env.storage().persistent().set(&key, &grant);
-        extend_ttl_address_key(&env, &key);
+        extend_ttl_access_key(&env, &key);
 
         // Add to patient's grants list
         let grants_key = (symbol_short!("GRANTS"), prep_data.patient.clone());
@@ -2611,6 +2626,94 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    pub fn trace_record_ancestors(
+        env: Env,
+        record_id: u64,
+        max_depth: u32,
+    ) -> teye_common::lineage::TraversalResult {
+        provenance_graph::trace_ancestors(&env, record_id, max_depth)
+    }
+
+    pub fn trace_record_descendants(
+        env: Env,
+        record_id: u64,
+        max_depth: u32,
+    ) -> teye_common::lineage::TraversalResult {
+        provenance_graph::trace_descendants(&env, record_id, max_depth)
+    }
+
+    pub fn export_record_dag(env: Env, record_id: u64, max_depth: u32) -> ProvenanceExport {
+        provenance_graph::export_dag(&env, record_id, max_depth)
+    }
+
+    pub fn verify_record_provenance(
+        env: Env,
+        record_id: u64,
+        max_depth: u32,
+    ) -> teye_common::lineage::VerificationResult {
+        provenance_graph::verify_provenance(&env, record_id, max_depth)
+    }
+
+    pub fn check_lineage_based_access(
+        env: Env,
+        record_id: u64,
+        requester: Address,
+        max_depth: u32,
+    ) -> LineageAccessResult {
+        let (result, _) =
+            provenance_graph::check_lineage_access(&env, record_id, &requester, max_depth);
+        result
+    }
+
+    pub fn collect_lineage_actors(env: Env, record_id: u64, max_depth: u32) -> Vec<Address> {
+        provenance_graph::collect_lineage_actors(&env, record_id, max_depth)
+    }
+
+    pub fn transition_record_state(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+        to_state: LifecycleState,
+        retention_until: u64,
+        expires_at: u64,
+        prerequisites_met: bool,
+    ) -> Result<TransitionRecord, ContractError> {
+        caller.require_auth();
+
+        let role = match rbac::get_active_assignment(&env, &caller).map(|a| a.role) {
+            Some(Role::Admin) => symbol_short!("ADMIN"),
+            Some(Role::Ophthalmologist) => symbol_short!("OPHT"),
+            Some(Role::Optometrist) => symbol_short!("PROV"),
+            _ => symbol_short!("USER"),
+        };
+
+        let ctx = TransitionContext {
+            actor: caller,
+            actor_role: role,
+            now: env.ledger().timestamp(),
+            retention_until,
+            expires_at,
+            prerequisites_met,
+        };
+
+        state_machine::apply_transition(
+            &env,
+            0,
+            &EntityKind::VisionRecord,
+            record_id,
+            to_state,
+            ctx,
+        )
+        .map_err(|_| ContractError::InvalidInput)
+    }
+
+    pub fn export_state_machine_dot(env: Env, kind: String) -> String {
+        if kind == String::from_str(&env, "vision_record") {
+            return state_machine::export_dot(&env, &EntityKind::VisionRecord);
+        }
+        state_machine::export_dot(&env, &EntityKind::Prescription)
+    }
+
     /// Prepare phase for adding a prescription
     pub fn prepare_add_prescription(
         env: Env,
@@ -2619,7 +2722,7 @@ impl VisionRecordsContract {
         prescription_data: prescription::PrescriptionData,
     ) -> Result<u64, ContractError> {
         // Validate without state changes
-        validation::validate_prescription_data(&prescription_data)?;
+        validation::validate_prescription_data(&prescription_data);
 
         // Check provider permissions
         let caller = provider.clone();
@@ -2672,9 +2775,14 @@ impl VisionRecordsContract {
             id: rx_id,
             patient: prep_data.patient.clone(),
             provider: prep_data.provider.clone(),
-            data: prep_data.prescription_data.clone(),
-            created_at: prep_data.timestamp,
+            lens_type: LensType::Glasses,
+            left_eye: prep_data.prescription_data.clone(),
+            right_eye: prep_data.prescription_data.clone(),
+            contact_data: OptionalContactLensData::None,
+            issued_at: prep_data.timestamp,
+            expires_at: prep_data.timestamp.saturating_add(31_536_000),
             verified: false,
+            metadata_hash: String::from_str(&env, ""),
         };
 
         // Store the prescription
@@ -2682,8 +2790,8 @@ impl VisionRecordsContract {
         env.storage().persistent().set(&key, &prescription);
         extend_ttl_u64_key(&env, &key);
 
-        // Add to patient's prescription history
-        prescription::add_to_patient_history(&env, prep_data.patient.clone(), rx_id);
+        // Add to patient's prescription history and lineage records.
+        prescription::save_prescription(&env, &prescription, None);
 
         // Clean up preparation data
         env.storage().temporary().remove(&prep_key);
@@ -2697,6 +2805,75 @@ impl VisionRecordsContract {
         let prep_key = (symbol_short!("P_ADD_RX"), rx_id);
         env.storage().temporary().remove(&prep_key);
 
+        Ok(())
+    }
+
+    // ── Query helpers ─────────────────────────────────────────────────────────
+
+    /// Return total number of records added.
+    pub fn get_record_count(env: Env) -> u64 {
+        let counter_key = symbol_short!("REC_CTR");
+        env.storage().instance().get(&counter_key).unwrap_or(0)
+    }
+
+    /// Get multiple records by their IDs.
+    pub fn get_records(env: Env, ids: Vec<u64>) -> Result<Vec<VisionRecord>, ContractError> {
+        let mut records: Vec<VisionRecord> = Vec::new(&env);
+        for i in 0..ids.len() {
+            let record_id = ids.get(i).unwrap();
+            let key = (symbol_short!("RECORD"), record_id);
+            let record: VisionRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(ContractError::RecordNotFound)?;
+            records.push_back(record);
+        }
+        Ok(records)
+    }
+
+    // ── Admin tier management ─────────────────────────────────────────────────
+
+    /// Return the admin tier for a given address.
+    pub fn get_admin_tier(env: Env, admin: Address) -> Option<AdminTier> {
+        admin_tiers::get_admin_tier(&env, &admin)
+    }
+
+    /// Promote a target address to the specified admin tier. SuperAdmin only.
+    pub fn promote_admin(
+        env: Env,
+        caller: Address,
+        target: Address,
+        tier: AdminTier,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let is_admin = {
+            let stored_admin: Option<Address> =
+                env.storage().instance().get(&symbol_short!("ADMIN"));
+            stored_admin.is_some_and(|a| a == caller)
+        };
+        let is_super_admin = admin_tiers::require_tier(&env, &caller, &AdminTier::SuperAdmin);
+        if !is_admin && !is_super_admin {
+            return Self::unauthorized(&env, &caller, "promote_admin", "SuperAdmin");
+        }
+        admin_tiers::set_admin_tier(&env, &target, tier);
+        admin_tiers::track_admin(&env, &target);
+        Ok(())
+    }
+
+    /// Remove a target's admin tier. SuperAdmin only.
+    pub fn demote_admin(env: Env, caller: Address, target: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let is_admin = {
+            let stored_admin: Option<Address> =
+                env.storage().instance().get(&symbol_short!("ADMIN"));
+            stored_admin.is_some_and(|a| a == caller)
+        };
+        let is_super_admin = admin_tiers::require_tier(&env, &caller, &AdminTier::SuperAdmin);
+        if !is_admin && !is_super_admin {
+            return Self::unauthorized(&env, &caller, "demote_admin", "SuperAdmin");
+        }
+        admin_tiers::untrack_admin(&env, &target);
         Ok(())
     }
 }
